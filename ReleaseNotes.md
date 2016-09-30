@@ -1,7 +1,5 @@
 ### Release Notes:
 ```
-### Release Notes:
-```
 0.4.5  - timestamp of reading state will not be changed if state == opened,present or absent
        - added internal INTERVAL
 0.4.6  - Attr Interval can be set 0 to disable presence check and polling
@@ -13,7 +11,5 @@
        - added internal UNIQIDS to devices
 0.4.7  - command reference updated
 0.4.8  - logging adopted
-
-```
 
 ```

@@ -1,4 +1,4 @@
-# ESPEasy (staging version 0.4.8+)
+# ESPEasy (staging version 0.4.9)
 ### FHEM Module To Control ESPEasy
 
 Required: ESPEasy R128+

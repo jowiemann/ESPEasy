@@ -11,5 +11,8 @@
        - added internal UNIQIDS to devices
 0.4.7  - command reference updated
 0.4.8  - logging adopted
+0.4.9  - fix check of empty device name, value name and values in received data
+       - do not process any data and log it continuously if ESPEasy Version
+         is too old. This will prevent wrong data and simplify support.
 
 ```

@@ -106,6 +106,7 @@
 #                    - added internal UNIQIDS to devices
 # 2016-09-29  0.4.7  - command reference updated
 # 2016-09-30  0.4.8  - logging adopted
+# 2016-10-01  0.4.9  - fix check of empty device name, value name and value in received data
 #                     
 #
 #
@@ -123,9 +124,10 @@ use MIME::Base64;
 use TcpServerUtils;
 use HttpUtils;
 
-my $ESPEasy_version         = "0.4.8";
 my $ESPEasy_minESPEasyBuild = 128;     # informational
 my $ESPEasy_minJsonVersion  = 1.02;    # checked in received data
+my $ESPEasy_version         = "0.4.9.staging";
+my $ESPEasy_urlCmd          = "/control?cmd=";
 
 # ------------------------------------------------------------------------------
 # "setCmds" => "min. number of parameters"
@@ -307,7 +309,7 @@ sub ESPEasy_Define($$)  # only called when defined, not on reload.
   $hash->{IDENT}     = $ident if defined $ident;
   $hash->{MODULE_VERSION}   = $ESPEasy_version;
 #  $hash->{NOTIFYDEV} = "global,$type";
-  $hash->{helper}{urlcmd} = "/control?cmd=";
+#  $hash->{helper}{urlcmd} = "/control?cmd=";
   
   if ($hash->{HOST} eq "bridge") {
     $hash->{SUBTYPE} = "bridge";
@@ -460,7 +462,6 @@ sub ESPEasy_Set($$@)
       my $hlist = join(",", @cList);
       $clist =~ s/help/help:$hlist/; # add all cmds as params to help cmd
       return "Unknown argument $cmd, choose one of ". $clist;
-      #return SetExtensions($hash, $clist, $name, $cmd, @params);
     }
 
     # pin mapping (eg. D8 -> 15)
@@ -551,14 +552,16 @@ sub ESPEasy_Read($) {
   my @data = split( '\R\R', $buf );
   my $header = ESPEasy_header2Hash($data[0]);
   
+  # Dump data for support
   Log3 $bname, 5, "$btype $bname: header: ".Dumper($header) if defined $header;
   Log3 $bname, 4, "$btype $bname: data: $data[1]" if defined $data[1];
 
-
+  # Check content length if defined
   if (defined $header->{'Content-Length'} 
   && $header->{'Content-Length'} != length($data[1])) {
     Log3 $bname, 1, "$btype $bname: Invalid content length ".
                     "($header->{'Content-Length'} != ".length($data[1]).")";
+    ESPEasy_sendHttpClose($hash->{CD},"400 Bad Request","");
     return;
   }
 
@@ -567,12 +570,11 @@ sub ESPEasy_Read($) {
     return;
   }
 
+  # No error occurred, send http respose OK
   ESPEasy_sendHttpClose($hash->{CD},"200 OK","");
 
+  # JSON received...
   if (defined $data[1] && $data[1] =~ m/"module":"ESPEasy"/) {
-
-#    delete $bhash->{helper}{outdated}{$peer}
-#      if exists $bhash->{helper}{outdated}{$peer};
 
     # remove illegal chars but keep JSON relevant chars.
     $data[1] =~ s/[^A-Za-z\d_\.\-\/\{}:,"]/_/g;
@@ -581,27 +583,34 @@ sub ESPEasy_Read($) {
     my $json;
     eval {$json = decode_json($data[1]);1;};
     if ($@) {
-     Log3 $bname, 2, "$btype $bname: Check your ESP config, an error occurred:";
+     Log3 $bname, 2, "$btype $bname: WARNING: deformed JSON data, check your "
+                    ."ESP config ($peer)";
      Log3 $bname, 2, "$btype $bname: $@";
      return;
     }
 
-    # remove illegal chars from ESP name
-    $json->{data}{ESP}{name} =~ s/[^A-Za-z\d_\.]/_/g;
-#    Log3 $bname, 5, "$btype $bname: Dumper \$content decoded: \n".Dumper($json)
-
-    ESPEasy_checkVersions($bhash,$json->{data}{ESP}{name},$json->{data}{ESP}{build},$json->{version});
+    # check that ESPEasy software is new enouph
+    return if ESPEasy_checkVersion(
+      $bhash,$json->{data}{ESP}{name},$json->{data}{ESP}{build},$json->{version}
+    );
     
-#    my @cmds;
-    my $as = (AttrVal($bname,"autosave",AttrVal("global","autosave",1))) ? 1 : 0;
-    my $ac = (AttrVal($bname,"autocreate",AttrVal("global","autoload_undefined_devices",1))) ? 1 : 0;
-    my $ui = (AttrVal($bname,"uniqIDs",1) == 1) ? 1 : 0;
-    my $uniqIDs = AttrVal($bname,"uniqIDs",1) ? $json->{data}{ESP}{name}."_" : "";
-    $json->{data}{SENSOR}{0}{deviceName} =~ s/[^A-Za-z\d_\.]/_/g;
-    my $dispatch = $uniqIDs.$json->{data}{SENSOR}{0}{deviceName}."::".$peer."::".$ac."::".$as."::".$ui."::";
-    my @values;
+    # remove illegal chars from ESP name for further processing
+    $json->{data}{ESP}{name} =~ s/[^A-Za-z\d_\.]/_/g;
 
-    # push internals & keep in bridge helper
+    # check that ESP name is set corretly
+    if ($json->{data}{ESP}{name} eq "") {
+      Log3 $bname, 2, "$btype $bname: WARNING: ESP device name is vacant "
+                     ."or contains illegal characters only ($peer). "
+                     ."Skip processing data.";
+      Log3 $bname, 2, "$btype $bname: data: $data[1]";
+      return;
+    }
+
+    # replace illegal characters with '_'
+    $json->{data}{SENSOR}{0}{deviceName} =~ s/[^A-Za-z\d_\.]/_/g;
+
+    # push internals in @values (& in bridge helper for support reason, only)
+    my @values;
     my @intVals = qw(unit sleep build);
     foreach my $intVal (@intVals) {
       push(@values,"i||".$intVal."||".$json->{data}{ESP}{$intVal}."||0");
@@ -615,32 +624,48 @@ sub ESPEasy_Read($) {
       && exists $json->{data}{SENSOR}{$vKey}{value}) {
         # remove illegal chars
         $json->{data}{SENSOR}{$vKey}{valueName} =~ s/[^A-Za-z\d_\.\-\/]/_/g;
-        my $dmsg = "r||".$json->{data}{SENSOR}{$vKey}{valueName}."||".
-                   $json->{data}{SENSOR}{$vKey}{value}."||".
-                   $json->{data}{SENSOR}{$vKey}{type};
-        if ($dmsg =~ m/(::::)|(::$)/) {
-          Log3 $bname, 2, "$btype $bname: WARNING: device name, value name or ".
-                          "value not received ($peer). Skipping data.";
-          next;
+        my $dmsg = "r||".$json->{data}{SENSOR}{$vKey}{valueName}
+                   ."||".$json->{data}{SENSOR}{$vKey}{value}
+                   ."||".$json->{data}{SENSOR}{$vKey}{type};
+        if ($dmsg =~ m/(\|\|\|\|)|(\|\|$)/) { #detect an empty value
+          Log3 $bname, 2, "$btype $bname: WARNING: value name or value is "
+                         ."vacant ($peer). Skip processing value.";
+          Log3 $bname, 2, "$btype $bname: data: $data[1]";
+          next; #skip further processing for this value only
         }
         push(@values,$dmsg);
       }
     }
-
     
-#    ESPEasy_dispatch($bhash,$peer,@cmds);
-    $dispatch .= join("|||",@values);
+    # prepare dispatch
+    
+    # collect attributes & general values for dispatch
+    my $as = AttrVal($bname,"autosave", AttrVal("global","autosave",1)) 
+      ? 1 : 0;
+    my $ac = AttrVal($bname,"autocreate", AttrVal("global","autoload_undefined_devices",1))
+      ? 1 : 0;
+    my $ui = AttrVal($bname,"uniqIDs",1) == 1
+      ? 1 : 0;
+    my $uniqIDs = AttrVal($bname,"uniqIDs",1)
+      ? $json->{data}{ESP}{name}."_" : "";
+    my $ident 
+      = $uniqIDs.$json->{data}{SENSOR}{0}{deviceName};
+
+    # combine dispatch message
+    my $dispatch = $ident."::".$peer."::".$ac."::".$as."::".$ui."::"
+                 . join("|||",@values);
+
+    # dispatch right now
+    Dispatch($bhash,$dispatch,undef);
     Log3 $bname, 4, "$btype $bname: dispatch: $dispatch";
-    Dispatch($bhash, $dispatch, undef);
 
   } #$data[1] =~ m/"module":"ESPEasy"/
 
   else {
-    Log3 $name, 2, "$btype $bname: error: wrong controller configured or "
+    Log3 $name, 2, "$btype $bname: WARNING: wrong controller configured or "
                    ."ESPEasy Version is too old.";
-    Log3 $name, 2, "$btype $bname: error: ESPEasy Version R"
-                   .$ESPEasy_minESPEasyBuild." or later required. "
-                   ."See: https://github.com/ESP8266nu/ESPEasy/";
+    Log3 $name, 2, "$btype $bname: WARNING: ESPEasy Version R"
+                   .$ESPEasy_minESPEasyBuild." or later required.";
   }
   
   return;
@@ -993,7 +1018,8 @@ sub ESPEasy_dispatchParse($$$) # called by logical device (defined by
 
         # map value to on/off if device is a switch
         $value = ($value eq "1") ? "on" : "off" 
-          if ($vType == 10 && AttrVal($name,"readingSwitchText",1) && $value =~ /^(0|1)$/);
+          if ($vType == 10 && AttrVal($name,"readingSwitchText",1) 
+          && $value =~ /^(0|1)$/);
 
         $value = ESPEasy_adjustValue($hash,$reading,$value);
 
@@ -1004,16 +1030,16 @@ sub ESPEasy_dispatchParse($$$) # called by logical device (defined by
         $hash->{helper}{received}{$reading} = $ip ;
       }
 
-      elsif ($fhemcmd eq "deletereading") {
+      elsif ($fhemcmd =~ m/^(deletereading|dr)$/) {
       }
       
-      elsif ($fhemcmd =~ /^(setinternal|i)$/) {
+      elsif ($fhemcmd =~ m/^(setinternal|i)$/) {
         $hash->{helper}{internals}{$ip}{uc($reading)} = $value;
         Log3 $name, 5, "$type $name: internal $reading: $value";
       }
       
       else {
-        Log3 $name, 1, "$type $name: Unkonwn command received via dispatch";
+        Log3 $name, 1, "$type $name: Unknown command received via dispatch";
       }
     } # foreach @v
 
@@ -1083,7 +1109,7 @@ sub ESPEasy_httpRequest($$$$$@)
   $params[0] = ",".$params[0] if $params[0];
   my $plist = join(",",@params);
 
-  $url = "http://".$host.":".$port.$hash->{helper}{urlcmd}.$cmd.$plist;
+  $url = "http://".$host.":".$port.$ESPEasy_urlCmd.$cmd.$plist;
   
   Log3 $name, 3, "$type $name: send $cmd$plist to $ident ($host)"
     if ($cmd !~ /^(status)/);
@@ -1365,25 +1391,22 @@ sub ESPEasy_clearReadings($)
 
 
 # ------------------------------------------------------------------------------
-sub ESPEasy_checkVersions($$$$)
+sub ESPEasy_checkVersion($$$$)
 {
   my ($hash,$dev,$ve,$vj) = @_;
   my ($type,$name) = ($hash->{TYPE},$hash->{NAME});
   my $ov = "_OUTDATED_ESP_VER_$dev";
 
-#  if (($vj < $ESPEasy_minJsonVersion 
-#  || $ve < $ESPEasy_minESPEasyBuild)
-#  && not exists $hash->{$ov}) {
-  if ($vj < $ESPEasy_minJsonVersion && not exists $hash->{$ov}) {
+  if ($vj < $ESPEasy_minJsonVersion) {
     $hash->{$ov} = "R".$ve."/J".$vj;
-    Log3 $name, 2, "$type $name: ESPEasy plugin _C009 ".
-                   "(R".$ve."/J".$vj.") is too old. ".
-                   "Use ESPEasy build R$ESPEasy_minESPEasyBuild at least.";
+    Log3 $name, 2, "$type $name: WARNING: no data processed. ESPEasy plugin "
+                  ."'FHEM HTTP' is too old [$dev: R".$ve." J".$vj."]. ".
+                   "Use ESPEasy R$ESPEasy_minESPEasyBuild at least.";
+  return 1;
   } 
-  
-  elsif ($ve >= $ESPEasy_minESPEasyBuild && $vj >= $ESPEasy_minJsonVersion
-  && exists $hash->{$ov}) {
-    delete $hash->{$ov};
+  else{
+    delete $hash->{$ov} if exists $hash->{$ov};
+    return 0;
   }
 }
 
@@ -1835,13 +1858,15 @@ sub ESPEasy_whoami()  {return (split('::',(caller(1))[3]))[1] || '';}
     <li>GPIO<br>
       Direct control of output pins (on/off)<br>
       required arguments: <code>&lt;pin&gt; &lt;0,1&gt;</code><br>
-      see <a href="http://www.esp8266.nu/index.php/GPIO">ESPEasy:GPIO</a> for
+      see <a target="_new"
+      href="http://www.esp8266.nu/index.php/GPIO">ESPEasy:GPIO</a> for
       details</li><br>
       
     <li>PWM<br>
       Direct PWM control of output pins<br>
       required arguments: <code>&lt;pin&gt; &lt;level&gt;</code><br>
-      see <a href="http://www.esp8266.nu/index.php/GPIO">ESPEasy:GPIO</a>
+      see <a target="_new" 
+      href="http://www.esp8266.nu/index.php/GPIO">ESPEasy:GPIO</a>
       for details</li><br>
       
     <li>PWMFADE<br>
@@ -1855,76 +1880,88 @@ sub ESPEasy_whoami()  {return (split('::',(caller(1))[3]))[1] || '';}
       Direct pulse control of output pins<br>
       required arguments: <code>&lt;pin&gt; &lt;0,1&gt; &lt;duration&gt;</code>
       <br>
-      see <a href="http://www.esp8266.nu/index.php/GPIO">ESPEasy:GPIO</a> for
+      see <a target="_new"
+      href="http://www.esp8266.nu/index.php/GPIO">ESPEasy:GPIO</a> for
       details</li><br>
       
     <li>LongPulse<br>
       Direct pulse control of output pins<br>
       required arguments: <code>&lt;pin&gt; &lt;0,1&gt; &lt;duration&gt;</code>
       <br>
-      see <a href="http://www.esp8266.nu/index.php/GPIO">ESPEasy:GPIO</a> for
+      see <a target="_new"
+      href="http://www.esp8266.nu/index.php/GPIO">ESPEasy:GPIO</a> for
       details</li><br>
 
     <li>Servo<br>
       Direct control of servo motors<br>
       required arguments: <code>&lt;servoNo&gt; &lt;pin&gt; &lt;position&gt;
       </code><br>
-      see <a href="http://www.esp8266.nu/index.php/GPIO">ESPEasy:GPIO</a> for
+      see <a target="_new" 
+      href="http://www.esp8266.nu/index.php/GPIO">ESPEasy:GPIO</a> for
       details</li><br>
       
     <li>lcd<br>
       Write text messages to LCD screen<br>
       required arguments: <code>&lt;row&gt; &lt;col&gt; &lt;text&gt;</code><br>
       see 
-      <a href="http://www.esp8266.nu/index.php/LCDDisplay">ESPEasy:LCDDisplay
+      <a target="_new" 
+      href="http://www.esp8266.nu/index.php/LCDDisplay">ESPEasy:LCDDisplay
       </a> for details</li><br>
       
     <li>lcdcmd<br>
       Control LCD screen<br>
       required arguments: <code>&lt;on|off|clear&gt;</code><br>
       see 
-      <a href="http://www.esp8266.nu/index.php/LCDDisplay">ESPEasy:LCDDisplay
+      <a target="_new" 
+      href="http://www.esp8266.nu/index.php/LCDDisplay">ESPEasy:LCDDisplay
       </a> for details</li><br>
       
     <li>mcpgpio<br>
       Control MCP23017 output pins<br>
       required arguments: <code>&lt;pin&gt; &lt;0,1&gt;</code><br>
-      see <a href="http://www.esp8266.nu/index.php/MCP23017">ESPEasy:MCP23017
+      see <a target="_new" 
+      href="http://www.esp8266.nu/index.php/MCP23017">ESPEasy:MCP23017
       </a>for details</li><br>
       
     <li>oled<br>
       Write text messages to OLED screen<br>
       required arguments: <code>&lt;row&gt; &lt;col&gt; &lt;text&gt;</code><br>
       see
-      <a href="http://www.esp8266.nu/index.php/OLEDDisplay">ESPEasy:OLEDDisplay
+      <a target="_new" 
+      href="http://www.esp8266.nu/index.php/OLEDDisplay">ESPEasy:OLEDDisplay
       </a> for details.</li><br>
       
     <li>oledcmd<br>
       Control OLED screen<br>
       required arguments: <code>&lt;on|off|clear&gt;</code><br>
       see 
-      <a href="http://www.esp8266.nu/index.php/OLEDDisplay">ESPEasy:OLEDDisplay
+      <a target="_new" 
+      href="http://www.esp8266.nu/index.php/OLEDDisplay">ESPEasy:OLEDDisplay
       </a> for details.</li><br>
       
     <li>pcapwm<br>
       Control PCA9685 pwm pins<br>
       required arguments: <code>&lt;pin&gt; &lt;level&gt;</code><br>
-      see <a href="http://www.esp8266.nu/index.php/PCA9685">ESPEasy:PCA9685</a>
+      see <a target="_new" 
+      href="http://www.esp8266.nu/index.php/PCA9685">ESPEasy:PCA9685</a>
       for details</li><br>
       
     <li>PCFLongPulse<br>
       Long pulse control on PCF8574 output pins<br>
-      see <a href="http://www.esp8266.nu/index.php/PCF8574">ESPEasy:PCF8574</a>
+      see <a target="_new" 
+      href="http://www.esp8266.nu/index.php/PCF8574">ESPEasy:PCF8574</a>
       for details</li><br>
 
     <li>PCFPulse<br>
       Pulse control on PCF8574 output pins<br>
-      see <a href="http://www.esp8266.nu/index.php/PCF8574">ESPEasy:PCF8574</a>
+      see <a target="_new" 
+      href="http://www.esp8266.nu/index.php/PCF8574">ESPEasy:PCF8574</a>
       for details</li><br>
       
     <li>pcfgpio<br>
       Control PCF8574 output pins<br>
-      see <a href="http://www.esp8266.nu/index.php/PCF8574">ESPEasy:PCF8574</a>
+      see <a target="_new" 
+      href="http://www.esp8266.nu/index.php/PCF8574">ESPEasy:PCF8574</a>
       </li><br>
       
     <li>raw<br>

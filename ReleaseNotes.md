@@ -14,5 +14,12 @@
 0.4.9  - fix check of empty device name, value name and values in received data
        - do not process any data and log it continuously if ESPEasy Version
          is too old. This will prevent wrong data and simplify support.
-
+0.5.0  - eval JSON decoding in http response
+       - removed Authorization String from debug log
+       - combined internals logging
+       - more detailed debug log (verbose 5, child bridge)
+       - check for temporary bridge device in deleteFn and do no IOWrite
+         see: https://forum.fhem.de/index.php/topic,55728.msg497366.html#msg497366
+       - added check that fhem.pl is new enough (11000/2016-03-05)
+         see: https://forum.fhem.de/index.php/topic,55728.msg497094.html#msg497094
 ```

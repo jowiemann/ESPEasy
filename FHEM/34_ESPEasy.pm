@@ -1,4 +1,4 @@
-# $Id$
+# $Id: 34_ESPEasy.pm 50 2016-10-02 08:30:00Z dev0 $
 ################################################################################
 #
 #  34_ESPEasy.pm is a FHEM Perl module to control ESP8266 / ESPEasy
@@ -106,14 +106,18 @@
 #                    - added internal UNIQIDS to devices
 # 2016-09-29  0.4.7  - command reference updated
 # 2016-09-30  0.4.8  - logging adopted
-# 2016-10-01  0.4.9  - fix check of empty device name, value name and value in received data
-#                     
-#
-#
-#   Credit goes to:
-#   - ESPEasy Project
+# 2016-10-01  0.4.9  - fixed check of empty device name, value name and value in received data
+# 2016-10-02  0.5.0  - eval JSON decoding in http response
+#                    - removed Authorization String from debug log
+#                    - combined internals logging
+#                    - more detailed debug log (verbose 5, child bridge)
+#                    - check for temporary bridge device in deleteFn and do no IOWrite
+#                      see: https://forum.fhem.de/index.php/topic,55728.msg497366.html#msg497366
+#                    - added check that fhem.pl is new enough (11000/2016-03-05)
+#                      see: https://forum.fhem.de/index.php/topic,55728.msg497094.html#msg497094
 #
 ################################################################################
+
 
 package main;
 
@@ -126,7 +130,7 @@ use HttpUtils;
 
 my $ESPEasy_minESPEasyBuild = 128;     # informational
 my $ESPEasy_minJsonVersion  = 1.02;    # checked in received data
-my $ESPEasy_version         = "0.4.9.staging";
+my $ESPEasy_version         = "0.5.0.staging";
 my $ESPEasy_urlCmd          = "/control?cmd=";
 
 # ------------------------------------------------------------------------------
@@ -303,8 +307,15 @@ sub ESPEasy_Define($$)  # only called when defined, not on reload.
 
   return "ERROR: perl module JSON is not installed"
     if (ESPEasy_isPmInstalled($hash,"JSON"));
-  #$hash->{helper}{noPm_JSON} = 1 if (ESPEasy_isPmInstalled($hash,"JSON"));
 
+  # check required fhem.pl version (internalTimer modifications are required)
+  # https://forum.fhem.de/index.php/topic,55728.msg497094.html#msg497094
+  AttrVal('global','version','') =~ m/^fhem.pl:(\d+)\/.*$/;
+  if (defined $1 && $1 < 11000) {
+    return "ERROR: fhem.pl ($1) is too old to use this $type module."
+          ." Version 11000/2016-03-05 is required at least." 
+  }
+  
   $hash->{PORT}      = $port;
   $hash->{IDENT}     = $ident if defined $ident;
   $hash->{MODULE_VERSION}   = $ESPEasy_version;
@@ -328,23 +339,24 @@ sub ESPEasy_Define($$)  # only called when defined, not on reload.
     $hash->{USER} = (defined $u) ? $u : "not defined yet !!!";
     my $p = getKeyValue($type."_".$name."-pass");
     $hash->{PASS} = (defined $p) ? "*" x length($p) : "not defined yet !!!";
-    
-    return undef;
   }
 
-  $hash->{INTERVAL} = 300;
-  $hash->{SUBTYPE} = "device";
+  else { # DEVICE
+    $hash->{INTERVAL} = 300;
+    $hash->{SUBTYPE} = "device";
 
-  AssignIoPort($hash,$iodev) if(not defined $hash->{IODev});
-  my $io = (defined($hash->{IODev}{NAME})) ? $hash->{IODev}{NAME} : "none";
-  Log3 $hash->{NAME}, 2, "$type $name: opened -> host:$hash->{HOST} ".
-                         "port:$hash->{PORT} iodev:$io ident:$ident";
+    AssignIoPort($hash,$iodev) if(not defined $hash->{IODev});
+    my $io = (defined($hash->{IODev}{NAME})) ? $hash->{IODev}{NAME} : "none";
+    Log3 $hash->{NAME}, 2, "$type $name: opened -> host:$hash->{HOST} ".
+                           "port:$hash->{PORT} iodev:$io ident:$ident";
 
-  readingsSingleUpdate($hash, 'state', 'opened',1);
-  
-  Log3 $name, 5, "$type $name: InternalTimer(".gettimeofday()."+5+".rand(5)
+    InternalTimer(gettimeofday()+5+rand(5), "ESPEasy_statusRequest", $hash);
+    Log3 $name, 5, "$type $name: InternalTimer(".gettimeofday()."+5+".rand(5)
                 .", ESPEasy_statusRequest, $hash)";
-  InternalTimer(gettimeofday()+5+rand(5), "ESPEasy_statusRequest", $hash);
+
+    readingsSingleUpdate($hash, 'state', 'opened',1);
+  }
+
   return undef;
 }
 
@@ -528,8 +540,8 @@ sub ESPEasy_Read($) {
   # Accept and create a child
   if( $hash->{SERVERSOCKET} ) {
     my $aRet = TcpServer_Accept( $hash, "ESPEasy" );
-    Log3 $bname, 5, "$btype $bname: accepted tcp connect <= "
-                    .$aRet->{PEER}.":".$aRet->{PORT};
+#    Log3 $bname, 5, "$btype $bname: accepted tcp connect <= "
+#                    .$aRet->{PEER}.":".$aRet->{PORT};
     return;
   }
 
@@ -543,7 +555,7 @@ sub ESPEasy_Read($) {
   # If there is an error in connection return
   if( !defined($ret ) || $ret <= 0 ) {
     CommandDelete( undef, $hash->{NAME} );
-    ESPEasy_sendHttpClose($hash->{CD},"400 Bad Request","");
+#    ESPEasy_sendHttpClose($hash,"400 Bad Request","");
     return;
   }
 
@@ -552,26 +564,28 @@ sub ESPEasy_Read($) {
   my @data = split( '\R\R', $buf );
   my $header = ESPEasy_header2Hash($data[0]);
   
-  # Dump data for support
-  Log3 $bname, 5, "$btype $bname: header: ".Dumper($header) if defined $header;
-  Log3 $bname, 4, "$btype $bname: data: $data[1]" if defined $data[1];
+  # Dump header/data for support without base64(user:pass)
+  my $logHeader = { %$header };
+  $logHeader->{Authorization} =~ s/Basic\s.*\s/Basic ***** /;
+  Log3 $bname, 5, "$btype $bname: header: ".Dumper($logHeader) if defined $logHeader;
+  Log3 $bname, 5, "$btype $bname: data: $data[1]" if defined $data[1];
 
   # Check content length if defined
   if (defined $header->{'Content-Length'} 
   && $header->{'Content-Length'} != length($data[1])) {
     Log3 $bname, 1, "$btype $bname: Invalid content length ".
                     "($header->{'Content-Length'} != ".length($data[1]).")";
-    ESPEasy_sendHttpClose($hash->{CD},"400 Bad Request","");
+    ESPEasy_sendHttpClose($hash,"400 Bad Request","");
     return;
   }
 
   if (!defined ESPEasy_isAuthenticated($bhash,$header->{Authorization},$peer)) {
-    ESPEasy_sendHttpClose($hash->{CD},"401 Unauthorized","");
+    ESPEasy_sendHttpClose($hash,"401 Unauthorized","");
     return;
   }
 
   # No error occurred, send http respose OK
-  ESPEasy_sendHttpClose($hash->{CD},"200 OK","");
+  ESPEasy_sendHttpClose($hash,"200 OK","");
 
   # JSON received...
   if (defined $data[1] && $data[1] =~ m/"module":"ESPEasy"/) {
@@ -579,13 +593,12 @@ sub ESPEasy_Read($) {
     # remove illegal chars but keep JSON relevant chars.
     $data[1] =~ s/[^A-Za-z\d_\.\-\/\{}:,"]/_/g;
 
-    # use JSON;
     my $json;
     eval {$json = decode_json($data[1]);1;};
     if ($@) {
-     Log3 $bname, 2, "$btype $bname: WARNING: deformed JSON data, check your "
-                    ."ESP config ($peer)";
-     Log3 $bname, 2, "$btype $bname: $@";
+      Log3 $bname, 2, "$btype $bname: WARNING: deformed JSON data, check your "
+                     ."ESP config ($peer)";
+      Log3 $bname, 2, "$btype $bname: $@";
      return;
     }
 
@@ -656,8 +669,8 @@ sub ESPEasy_Read($) {
                  . join("|||",@values);
 
     # dispatch right now
+#    Log3 $bname, 4, "$btype $bname: dispatch: $dispatch";
     Dispatch($bhash,$dispatch,undef);
-    Log3 $bname, 4, "$btype $bname: dispatch: $dispatch";
 
   } #$data[1] =~ m/"module":"ESPEasy"/
 
@@ -882,6 +895,10 @@ sub ESPEasy_Undef($$)
 {
   my ($hash, $arg) = @_;
   my ($name,$type,$port) = ($hash->{NAME},$hash->{TYPE},$hash->{PORT});
+
+  #return if it is a child process for incoming http requests
+  return undef if defined $hash->{TEMPORARY} && $hash->{TEMPORARY} == 1;
+
   HttpUtils_Close($hash);
   RemoveInternalTimer($hash);
   
@@ -915,13 +932,18 @@ sub ESPEasy_Shutdown($)
 sub ESPEasy_Delete($$)
 {
   my ($hash, $arg) = @_;
+  #return if it is a child process for incoming http requests
+  if (defined $hash->{TEMPORARY} && $hash->{TEMPORARY} == 1) {
+    my $bhash = $modules{ESPEasy}{defptr}{BRIDGE};
+    Log3 $hash->{NAME}, 5, "$bhash->{TYPE} $bhash->{NAME}: child connection $hash->{PEER}:$hash->{PORT} deleted";
+  }
+  else {
+    setKeyValue($hash->{TYPE}."_".$hash->{NAME}."-user",undef);
+    setKeyValue($hash->{TYPE}."_".$hash->{NAME}."-pass",undef);
+    setKeyValue($hash->{TYPE}."_".$hash->{NAME}."-firstrun",undef);
 
-  # delete entries
-  setKeyValue($hash->{TYPE}."_".$hash->{NAME}."-user",undef);
-  setKeyValue($hash->{TYPE}."_".$hash->{NAME}."-pass",undef);
-  setKeyValue($hash->{TYPE}."_".$hash->{NAME}."-firstrun",undef);
-
-  Log3 $hash->{NAME}, 5, "$hash->{TYPE} $hash->{NAME}: $hash->{NAME} deleted";
+    Log3 $hash->{NAME}, 5, "$hash->{TYPE} $hash->{NAME}: $hash->{NAME} deleted";
+  }
   return undef;
 }
 
@@ -946,7 +968,7 @@ sub ESPEasy_dispatch($$@) #called by bridge -> send to logical devices
     my $msg = $ident."::".$host."::".$ac."::".$as."::".$ui."::"
             . $fhemcmd."||".$reading."||".$value."||".$vType;
 
-    Log3 $name, 4, "$type $name: dispatch: $msg";
+#    Log3 $name, 4, "$type $name: dispatch: $msg";
     Dispatch($hash, $msg, undef);
   }
   return undef;
@@ -961,12 +983,10 @@ sub ESPEasy_dispatchParse($$$) # called by logical device (defined by
   my ($IOhash, $msg) = @_;   # IOhash points to the ESPEasy bridge, not device
   my $IOname = $IOhash->{NAME};
   my $type   = $IOhash->{TYPE};
-  my $self   = ESPEasy_whoami()."()";
 
+#  Log 5, "$type $IOname: $msg";
   # 1:ident 2:ip 3:autocreate 4:autosave 5:data
   my ($ident,$ip,$ac,$as,$ui,$v) = split("::",$msg);
-  Log 5, "$type $IOname: $self got: $msg";
-  
 
   return undef if !$ident || $ident eq "";
 
@@ -1003,6 +1023,7 @@ sub ESPEasy_dispatchParse($$$) # called by logical device (defined by
   if (defined $hash && $hash->{TYPE} eq "ESPEasy"
   && $hash->{SUBTYPE} eq "device") {
     $hash->{UNIQIDS} = $ui;
+    my @logInternals;
     foreach (@v) {
       my ($fhemcmd,$reading,$value,$vType) = split("\\|\\|",$_);
 
@@ -1035,7 +1056,7 @@ sub ESPEasy_dispatchParse($$$) # called by logical device (defined by
       
       elsif ($fhemcmd =~ m/^(setinternal|i)$/) {
         $hash->{helper}{internals}{$ip}{uc($reading)} = $value;
-        Log3 $name, 5, "$type $name: internal $reading: $value";
+        push(@logInternals,"$reading:$value");
       }
       
       else {
@@ -1043,6 +1064,8 @@ sub ESPEasy_dispatchParse($$$) # called by logical device (defined by
       }
     } # foreach @v
 
+    Log3 $name, 5, "$type $name: internals: ".join(" ",@logInternals)
+      if scalar @logInternals > 0;
     ESPEasy_setESPConfig($hash);
     ESPEasy_checkPresence($hash,$ip);
     ESPEasy_setState($hash);
@@ -1144,7 +1167,7 @@ sub ESPEasy_httpRequestParse($$$)
 {
   my ($param, $err, $data) = @_;
   my $hash = $param->{hash};
-  my ($name,$type,$self) = ($hash->{NAME},$hash->{TYPE},ESPEasy_whoami());
+  my ($name,$type) = ($hash->{NAME},$hash->{TYPE});
   my @dispatchCmd;
   
   if ($err ne "") {
@@ -1154,33 +1177,36 @@ sub ESPEasy_httpRequestParse($$$)
   elsif ($data ne "") 
   { 
     # no errors occurred
-    Log3 $name, 5, "$type $name: $self() data: \n$data";
-    if (!defined $hash->{helper}{noPm_JSON}) {
-      if ($data =~ /^{/) { #it is json...
-        # use JSON;
-        my %res = %{decode_json($data)};
-        Log3 $name, 5, "$type $name: $param->{cmd}$param->{plist} => "
-                      ."mode:$res{mode} state:$res{state}";
+    Log3 $name, 5, "$type $name: parse data: \n$data";
+    if ($data =~ /^{/) { #it is json...
 
-        # maps plugin type (answer for set state/gpio) to SENSOR_TYPE_SWITCH
-        # 10 = SENSOR_TYPE_SWITCH
-        my $vType = (defined $res{plugin} && $res{plugin} eq "1") ? "::10" : "";
-        push @dispatchCmd, "r::".$param->{ident}."::GPIO".$res{pin}.
-                           "_mode::".$res{mode};
-        push @dispatchCmd, "r::".$param->{ident}."::GPIO".$res{pin}.
-                           "_state::".$res{state}.$vType;
-        push @dispatchCmd, "r::".$param->{ident}."::_lastAction::".
-                           $res{log} if $res{log} ne "";
-      } #it is json...
-
-      else { # no json returned => unknown state => delete readings
-        Log3 $name, 5, "$type $name: no json fmt: $param->{cmd}$param->{plist}".
-                       " => $data";
+#      my %res = %{decode_json($data)};
+      my %res;
+      eval {%res = %{decode_json($data)};1;};
+      if ($@) {
+       Log3 $name, 2, "$type $name: WARNING: deformed JSON data received ($param->{host}).";
+       Log3 $name, 2, "$type $name: $@";
+       return undef;
       }
-    }
 
-    else { # no json installed
-      Log3 $name, 2, "$type $name: perl module JSON not installed.";
+      Log3 $name, 5, "$type $name: $param->{cmd}$param->{plist} => "
+                    ."mode:$res{mode} state:$res{state}";
+
+      # maps plugin type (answer for set state/gpio) to SENSOR_TYPE_SWITCH
+      # 10 = SENSOR_TYPE_SWITCH
+      my $vType = (defined $res{plugin} && $res{plugin} eq "1") ? "::10" : "";
+      push @dispatchCmd, "r::".$param->{ident}."::GPIO".$res{pin}.
+                         "_mode::".$res{mode};
+      push @dispatchCmd, "r::".$param->{ident}."::GPIO".$res{pin}.
+                         "_state::".$res{state}.$vType;
+      push @dispatchCmd, "r::".$param->{ident}."::_lastAction::".
+                         $res{log} if $res{log} ne "";
+    } #it is json...
+
+    else { # no json returned => unknown state => delete readings
+      Log3 $name, 5, "$type $name: no json fmt: $param->{cmd}$param->{plist}".
+                     " => $data";
+    return undef;
     }
   } # ($data ne "") 
 
@@ -1300,7 +1326,7 @@ sub ESPEasy_tcpServer_Open($) {
   my $ret = TcpServer_Open( $hash, $port, "global" );
     
   if( $ret && !$init_done ) {
-    Log3 $name, 2, "$type $name: => $ret. Exiting.";
+#    Log3 $name, 2, "$type $name: => $ret. Exiting.";
     exit(1);
   }
     
@@ -1330,15 +1356,18 @@ sub ESPEasy_header2Hash($) {
 
 # ------------------------------------------------------------------------------
 sub ESPEasy_sendHttpClose($$$) {
-
-    my ($con,$code,$response) = @_;
-    print $con "HTTP/1.1 ".$code."\r\n",
-           "Content-Type: text/plain\r\n",
-           "Connection: close\r\n",
-           "Content-Length: ".length($response)."\r\n\r\n",
-           $response;
-        
-    return undef;
+  my ($hash,$code,$response) = @_;
+  my ($name,$type,$con) = ($hash->{NAME},$hash->{TYPE},$hash->{CD});
+  my $bhash = $modules{ESPEasy}{defptr}{BRIDGE};
+  my ($bname,$btype) = ($bhash->{NAME},$bhash->{TYPE});
+  
+  print $con "HTTP/1.1 ".$code."\r\n",
+         "Content-Type: text/plain\r\n",
+         "Connection: close\r\n",
+         "Content-Length: ".length($response)."\r\n\r\n",
+         $response;
+  Log3 $bname, 5, "$btype $bname: send http response: $code $response";
+  return undef;
 }
 
 
